@@ -78,7 +78,7 @@ class SerialSource(LineSource):
         import serial
         while not self.stopped.is_set():
             try:
-                with serial.Serial(self.port, self.baud, timeout=0.5) as ser:
+                with serial.serial_for_url(self.port, self.baud, timeout=0.5) as ser:  # port or socket://ip:23 (Wi-Fi)
                     self.ser = ser
                     self.status = f"connected {self.port} @ {self.baud}"
                     while not self.stopped.is_set():
@@ -554,7 +554,7 @@ class App:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Map a maze live from the Arduino robot's ultrasonic sensors.")
     src = ap.add_mutually_exclusive_group()
-    src.add_argument("--port", help="serial port, e.g. COM5 (default: auto-detect)")
+    src.add_argument("--port", help="serial port (e.g. COM5) or Wi-Fi robot: socket://192.168.8.115:23 (default: auto-detect serial)")
     src.add_argument("--sim", action="store_true", help="use the built-in maze simulator")
     src.add_argument("--replay", metavar="LOG", help="replay a log recorded with --log")
     ap.add_argument("--baud", type=int, default=115200)
@@ -569,7 +569,8 @@ def main() -> None:
     ap.add_argument("--sim-seed", type=int, default=None)
     ap.add_argument("--sim-size", type=int, nargs=2, default=(6, 6), metavar=("COLS", "ROWS"))
     ap.add_argument("--maze-cell", type=float, default=35.0,
-                    help="maze corridor width, cm: wall lines and return-home snap to this grid")
+                    help="maze corridor width, cm: wall lines and return-home snap to this grid "
+                         "(0 = unknown: no grid, raw sonar map + motor odometry)")
     ap.add_argument("--sim-cell", type=float, default=None, help="sim corridor width, cm (default: --maze-cell)")
     ap.add_argument("--sim-drift", type=float, default=0.0,
                     help="odometry error in the sim, e.g. 0.05 = robot really 5%% faster than assumed")
@@ -577,7 +578,12 @@ def main() -> None:
 
     cfg = RobotConfig(speed_cm_s=args.speed, wheelbase_cm=args.wheelbase,
                       sensors=sensor_mounts(args.side_angle))
+    no_grid = args.maze_cell <= 0
+    if no_grid:
+        args.maze_cell = 35.0   # placeholder for go-to/home; grid snapping is off below
     mapper = MazeMapper(cfg, args.map_size, args.cell, maze_cell_cm=args.maze_cell)
+    if no_grid:
+        mapper.tracker.correct = False
 
     sim = None
     if args.sim:
@@ -597,7 +603,10 @@ def main() -> None:
             sys.exit("Pass one with --port, or use --sim to try the simulator.")
         source = SerialSource(port, args.baud)
 
-    App(source, mapper, log_path=args.log, sim=sim, maze_cell_cm=args.maze_cell).run()
+    app = App(source, mapper, log_path=args.log, sim=sim, maze_cell_cm=args.maze_cell)
+    if no_grid:
+        app.show_lines = False
+    app.run()
 
 
 if __name__ == "__main__":
