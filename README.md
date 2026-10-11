@@ -13,7 +13,7 @@ python maze_mapper.py --port COM5           # if auto-detect fails
 python maze_mapper.py --replay run1.log     # watch a recorded run again
 ```
 
-Controls: wheel zoom · drag pan · F follow · R reset · Q/E rotate heading ±5° · S save PNG · L wall lines · G show sim's hidden maze · H (or the top-right button) stop & return home · P (or the button below it) go to a point · Esc quit
+Controls: Space start the robot (sends GO) · X stop it · wheel zoom · drag pan · F follow · R reset · Q/E rotate heading ±5° · S save PNG · L wall lines · G show sim's hidden maze · H (or the top-right button) stop & return home · P (or the button below it) go to a point · Esc quit
 
 ## How it works
 

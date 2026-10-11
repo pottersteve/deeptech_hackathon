@@ -24,13 +24,12 @@ from datetime import datetime
 import numpy as np
 import pygame
 
-from mapping import MazeMapper, RobotConfig, lattice_walls, parse_line, sensor_mounts
+from mapping import MazeMapper, RobotConfig, parse_line, parse_turn, sensor_mounts
 from navigation import DriveTo, nearest_visited
 
 UNKNOWN = np.array([196, 199, 204], dtype=np.float32)
-FREE = np.array([250, 250, 247], dtype=np.float32)
+FREE = np.array([226, 228, 230], dtype=np.float32)  # a light tint, so walls stand out
 WALL = np.array([24, 32, 56], dtype=np.float32)
-WALL_FAINT = np.array([150, 158, 178], dtype=np.float32)  # raw sonar hits, when wall lines are drawn on top
 WALL_LINE = (20, 26, 48)
 ROUTE_COLOR = (0, 150, 160)
 BUTTON_GO = (200, 50, 50)
@@ -177,13 +176,12 @@ class App:
         self.follow = True
         self.show_truth = False  # G toggles the simulator's hidden maze, for checking accuracy
         self.show_lines = True   # L toggles wall lines snapped to the maze lattice
+        self.show_distances = True  # D toggles the sensor distances pinned along the path
         self.dragging = False
         self.console: deque[str] = deque(maxlen=6)
         self.rate_times: deque[float] = deque(maxlen=50)
         self._map_surface = None
         self._map_key = None
-        self._walls: list[tuple[float, float, float, float]] = []
-        self._walls_version = -1
         self.drive: DriveTo | None = None  # current return-home / go-to-point trip
         self.drive_home = False             # ...and whether it's the return home
         self.picking = False                # waiting for a click on the map to pick a go-to point
@@ -198,6 +196,11 @@ class App:
         if self.log:
             self.log.write(line + "\n")
         t = parse_line(line)
+        turn = parse_turn(line)
+        if turn is not None:
+            self.mapper.spin(turn[1], turn[2])
+            self.console.append(f"spun {'left' if turn[1] > 0 else 'right'} for {turn[2]} ms")
+            return
         if t is None:
             self.console.append(line[:120])
             if line.startswith("EXIT"):
@@ -279,9 +282,9 @@ class App:
         grid = self.mapper.grid
         key = (grid.version, self.show_lines)
         if key != self._map_key:
-            wall = WALL_FAINT if self.show_lines else WALL
-            a = np.clip(grid.logodds / 2.5, -1.0, 1.0)[..., None]
-            rgb = np.where(a < 0, UNKNOWN + (FREE - UNKNOWN) * -a, UNKNOWN + (wall - UNKNOWN) * a)
+            # only free space is shaded: walls are the lines traced from the echoes (draw_echo_walls)
+            a = np.clip(grid.logodds / 2.5, -1.0, 0.0)[..., None]
+            rgb = UNKNOWN + (FREE - UNKNOWN) * -a
             # rows are y-up; the screen is y-down, and surfarray wants [x, y]
             self._map_surface = pygame.surfarray.make_surface(
                 np.ascontiguousarray(rgb[::-1].transpose(1, 0, 2)).astype(np.uint8))
@@ -304,15 +307,27 @@ class App:
         scaled = pygame.transform.scale(sub, (max(1, round((c1 - c0) * px)), max(1, round((r1 - r0) * px))))
         self.screen.blit(scaled, self.to_screen((c0 - grid.origin) * grid.cell, (r1 - grid.origin) * grid.cell))
 
+    def draw_echo_walls(self) -> None:
+        """The walls traced from the echoes, as thin lines (when the straight maze walls are off)."""
+        if self.show_lines:
+            return
+        width = max(1, round(0.6 * self.zoom))
+        w, h = self.screen.get_size()
+        color = tuple(int(c) for c in WALL)
+        for x1, y1, x2, y2 in self.mapper.walls:
+            a, b = self.to_screen(x1, y1), self.to_screen(x2, y2)
+            if not (-10 < a[0] < w + 10 and -10 < a[1] < h + 10):
+                continue
+            if a == b:
+                self.screen.fill(color, (a[0] - width // 2, a[1] - width // 2, width, width))
+            else:
+                pygame.draw.line(self.screen, color, a, b, width)
+
     def draw_walls(self) -> None:
         if not self.show_lines:
             return
-        grid = self.mapper.grid
-        if grid.version != self._walls_version:
-            self._walls = lattice_walls(grid, self.maze_cell, self.mapper.path)
-            self._walls_version = grid.version
         width = max(3, int(1.5 * self.zoom))
-        for x1, y1, x2, y2 in self._walls:
+        for x1, y1, x2, y2 in self.mapper.straight_walls():
             a, b = self.to_screen(x1, y1), self.to_screen(x2, y2)
             pygame.draw.line(self.screen, WALL_LINE, a, b, width)
             for end in (a, b):  # round ends so corners join cleanly
@@ -366,6 +381,26 @@ class App:
         text = self.small.render(label, True, color)
         self.screen.blit(text, (pos[0] - text.get_width() // 2, pos[1] - r - text.get_height()))
 
+    def draw_distance_marks(self) -> None:
+        """The sensor distances pinned to the map along the way (D toggles)."""
+        if not self.show_distances:
+            return
+        w, h = self.screen.get_size()
+        fmt = lambda d: f"{d:.0f}" if d > 0 else "-"
+        drawn: list[pygame.Rect] = []
+        for x, y, left, front, right in self.mapper.distance_marks:
+            pos = self.to_screen(x, y)
+            if not (-100 < pos[0] < w + 100 and -20 < pos[1] < h + 20):
+                continue
+            pygame.draw.circle(self.screen, TEXT, pos, 2)
+            text = self.small.render(f"L{fmt(left)} F{fmt(front)} R{fmt(right)}", True, TEXT)
+            box = text.get_rect(midleft=(pos[0] + 5, pos[1]))
+            if box.inflate(4, 2).collidelist(drawn) != -1:
+                continue  # would cover another label: zoom in to see it
+            drawn.append(box.inflate(4, 2))
+            self.screen.fill((250, 250, 247), box.inflate(4, 2))
+            self.screen.blit(text, box)
+
     def draw_markers(self) -> None:
         self.draw_marker(0, 0, START_COLOR, "START")
         if self.mapper.exit_pos:
@@ -384,11 +419,12 @@ class App:
                 pygame.draw.circle(self.screen, color, b, 4)
 
         pose = m.pose
-        r = max(4, int(m.cfg.wheelbase_cm / 2 * self.zoom))
+        front = m.cfg.wheels_from_front_cm                 # pose point = midpoint between the wheels
+        back, hw = front - m.cfg.length_cm, m.cfg.width_cm / 2
+        body = [self.to_screen(*pose.to_world(f, s)) for f, s in ((front, hw), (front, -hw), (back, -hw), (back, hw))]
         center = self.to_screen(pose.x, pose.y)
-        pygame.draw.circle(self.screen, ROBOT_COLOR, center, r)
-        pygame.draw.line(self.screen, (255, 255, 255), center,
-                         self.to_screen(*pose.to_world(m.cfg.wheelbase_cm / 2, 0)), 3)
+        pygame.draw.polygon(self.screen, ROBOT_COLOR, body)
+        pygame.draw.line(self.screen, (255, 255, 255), center, self.to_screen(*pose.to_world(front, 0)), 3)
 
     def draw_truth(self) -> None:
         if not (self.sim and self.show_truth):
@@ -449,8 +485,8 @@ class App:
         self.draw_panel(lines, (10, 10), self.font)
 
         w, h = self.screen.get_size()
-        help_text = "wheel zoom | drag pan | F follow" + (" (on)" if self.follow else "") + \
-                    " | R reset | Q/E rotate | S save | L lines" + (" | G sim maze" if self.sim else "") + \
+        help_text = "Space GO | X stop | wheel zoom | drag pan | F follow" + (" (on)" if self.follow else "") + \
+                    " | R reset | Q/E rotate | S save | L lines | D distances" + (" | G sim maze" if self.sim else "") + \
                     " | H home | P go to | Esc quit"
         self.draw_panel(list(self.console) + [help_text], (10, h - 10), self.small, anchor_bottom=True)
 
@@ -463,8 +499,10 @@ class App:
             self.cam = [self.mapper.pose.x, self.mapper.pose.y]
         self.screen.fill(tuple(int(c) for c in UNKNOWN))
         self.draw_map()
+        self.draw_echo_walls()
         self.draw_walls()
         self.draw_truth()
+        self.draw_distance_marks()
         self.draw_markers()
         self.draw_route()
         self.draw_robot()
@@ -521,12 +559,19 @@ class App:
                 self.toggle_go_to()
             elif e.key == pygame.K_l:
                 self.show_lines = not self.show_lines
+            elif e.key == pygame.K_d:
+                self.show_distances = not self.show_distances
             elif e.key == pygame.K_q:
                 self.mapper.rotate(5)
             elif e.key == pygame.K_e:
                 self.mapper.rotate(-5)
             elif e.key == pygame.K_s:
                 self.save_screenshot()
+            elif e.key == pygame.K_SPACE:
+                self.console.append("sent GO" if self.source.send("GO") else "can't send commands to this source")
+            elif e.key == pygame.K_x:
+                self.cancel_drive()
+                self.console.append("sent STOP" if self.source.send("STOP") else "can't send commands to this source")
             elif e.key == pygame.K_g:
                 self.show_truth = not self.show_truth
         return True
@@ -560,9 +605,26 @@ def main() -> None:
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--log", metavar="FILE", help="append every received line to FILE")
     ap.add_argument("--speed", type=float, default=20.0, help="robot ground speed at full power, cm/s (a rough value is fine: the sonars correct it)")
+    ap.add_argument("--spin-rate", type=float, default=180.0,
+                    help="how fast the robot turns when it spins on the spot, deg/s (a T line turns the map "
+                         "by this x its duration; 180 = a 500 ms spin is 90 deg)")
     ap.add_argument("--wheelbase", type=float, default=9.0, help="distance between wheels, cm")
+    ap.add_argument("--robot-length", type=float, default=16.0, help="robot body length, cm (drawing only)")
+    ap.add_argument("--robot-width", type=float, default=12.0, help="robot body width, cm (drawing only)")
+    ap.add_argument("--wheels-from-front", type=float, default=12.0,
+                    help="midpoint between the wheels, cm back from the front of the robot (drawing only)")
+    ap.add_argument("--front-sensor", type=float, default=12.0, metavar="FWD",
+                    help="front sensor, cm ahead of the midpoint between the wheels")
+    ap.add_argument("--side-sensors", type=float, nargs=2, default=(10.0, 10.0), metavar=("FWD", "APART"),
+                    help="left/right sensors: cm ahead of the midpoint between the wheels, and cm apart")
     ap.add_argument("--side-angle", type=float, default=30.0,
                     help="how far the left/right sensors point out from straight ahead, degrees")
+    ap.add_argument("--max-range", type=float, default=100.0,
+                    help="ignore echoes this far or further, cm: long ones come through gaps from outside the maze")
+    ap.add_argument("--swap-sides", action="store_true",
+                    help="the robot's 'left' reading comes from its right sensor and vice versa")
+    ap.add_argument("--sonar-only", action="store_true",
+                    help="track the robot from the sonar distances alone, ignoring the motor values")
     ap.add_argument("--map-size", type=float, default=1000.0, help="map width/height, cm")
     ap.add_argument("--cell", type=float, default=2.0, help="map resolution, cm per cell")
     ap.add_argument("--playback-speed", type=float, default=1.0, help="time multiplier for --sim/--replay")
@@ -576,14 +638,21 @@ def main() -> None:
                     help="odometry error in the sim, e.g. 0.05 = robot really 5%% faster than assumed")
     args = ap.parse_args()
 
-    cfg = RobotConfig(speed_cm_s=args.speed, wheelbase_cm=args.wheelbase,
-                      sensors=sensor_mounts(args.side_angle))
+    mounts = sensor_mounts(args.side_angle, args.front_sensor, *args.side_sensors)
+    if args.swap_sides:
+        mounts["left"], mounts["right"] = mounts["right"], mounts["left"]
+    cfg = RobotConfig(speed_cm_s=args.speed, wheelbase_cm=args.wheelbase, max_range_cm=args.max_range,
+                      spin_deg_s=args.spin_rate, sensors=mounts,
+                      length_cm=args.robot_length, width_cm=args.robot_width,
+                      wheels_from_front_cm=args.wheels_from_front)
     no_grid = args.maze_cell <= 0
     if no_grid:
         args.maze_cell = 35.0   # placeholder for go-to/home; grid snapping is off below
     mapper = MazeMapper(cfg, args.map_size, args.cell, maze_cell_cm=args.maze_cell)
     if no_grid:
         mapper.tracker.correct = False
+    if args.sonar_only:
+        mapper.tracker.use_motors = False
 
     sim = None
     if args.sim:
