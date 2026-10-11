@@ -1,0 +1,8 @@
+{
+  "port": "socket://192.168.8.115:23",
+  "log": "run10.log",
+  "max_range": 100.0,
+  "maze_cell": 0.0,
+  "sonar_only": true,
+  "side_angle": 90.0
+}
